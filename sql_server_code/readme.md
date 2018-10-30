@@ -6,4 +6,4 @@ Added Formatting Line feed
 
 Added new comment
 
-Update Code | Commit | Merge | Push
+Update Code | Commit | Push
