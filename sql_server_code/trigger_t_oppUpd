@@ -1,0 +1,286 @@
+USE [CRM]
+GO
+
+/****** Object:  Trigger [dbo].[t_oppoUpd]    Script Date: 29/10/2018 5:34:09 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+-- =============================================
+-- Author:		OPN365 Pty Ltd, Stuart Robertson
+-- Create date: 2018-10-08
+-- Description:	Calculate freight
+-- =============================================
+
+ALTER TRIGGER [dbo].[t_oppoUpd]
+
+ON   [dbo].[Opportunity]
+
+AFTER UPDATE
+
+  AS
+
+DECLARE
+@oppocode int,							--> oppo id
+@usercode int,							--> current user
+@custcode varchar(24),					-->
+
+@frtorgn varchar(40),					--> load port
+@frtdest varchar(40),					--> destination
+@frtdest_code varchar(40),				--> destination
+
+@frtmode varchar(20),					-->
+@frtterm varchar(20),					-->
+@frtfis varchar(20),					-->
+
+@frtstatus nvarchar(40),
+@frttype varchar(10),					--> fcl or lcl
+@frteqpt varchar(10),					--> 20gp or 40gp
+
+@frtqty int,							--> calc frt qty
+@frtctncubic numeric(24,6),				--> calc frt ctn m3
+@frtnuminctn int,						--> calc frt num in ctn
+@frtcubic numeric(24,6),				--> calc frt m3
+@frtamt numeric(24,6),					--> calc frt amount
+@frtopttlamt numeric(24,6),				--> calc totalcost USD
+@frtopttlcstnzd numeric(24,6),			--> calc totalcost NZD
+@frtopttlvalusd  numeric(24,6),			--> calc totalvalue USD
+@frtopttlprdcstusd numeric(24,6),		--> calc totalcost product USD
+@frtopttlprdcstnzd numeric(24,6),		--> calc totalcost product NZD
+@frtunitcst numeric(24,6),				--> calc unitcost product USD
+@frtothcst numeric(24,6),				--> calc totalcost other USD
+@frtexchrate numeric(24,6),				--> fx rate
+@frtopforecast numeric(24,6),			--> forecast USD
+@frtopestvalmgn numeric(24,6),			--> est margin val
+@frtopestpctmgn numeric(24,6)			--> est margin pcnt
+
+BEGIN
+SET NOCOUNT ON;
+IF UPDATE (oppo_frtcalcstate)
+          begin
+SELECT
+  @oppocode = (Oppo_OpportunityId),
+  @usercode = (Oppo_UpdatedBy),
+  @custcode = rtrim(oppo_custcode),
+
+  @frtorgn = rtrim(oppo_origin),
+  @frtdest_code = rtrim(oppo_DeliveryDest),
+  @frtmode = rtrim(oppo_suppmodeoftransport),
+  @frtterm = rtrim(oppo_suppshipmentterms),
+  @frtfis = rtrim(oppo_FISorFreight),
+
+  @frtstatus = rtrim(oppo_frtcalcstate),
+  @frttype = rtrim(oppo_frtcalctype),
+  @frteqpt = rtrim(oppo_frtcalceqpt),
+
+  @frtctncubic = oppo_frtcalcctnsize,
+  @frtnuminctn = oppo_frtcalcnuminctn,
+  @frtcubic = oppo_frtcalccubic,
+
+  @frtamt = oppo_freight,							--> oppo_freight
+  @frtopttlcstnzd = oppo_totnzdcosts,				--> oppo_totnzdcosts
+@frtopttlvalusd = oppo_totalusdvalue,			--> oppo_totalusdvalue
+@frtopttlprdcstusd = oppo_totalproductusdcost,	--> oppo_totalproductusdcost
+@frtopttlprdcstnzd = oppo_totalproductnzdcost,	--> oppo_totalproductnzdcost
+
+@frtqty = oppo_quantityreq,						--> oppo_quantityreq
+@frtunitcst = oppo_costperunit,					--> oppo_costperunit
+@frtothcst = oppo_othercosts,					--> oppo_othercosts
+@frtexchrate = oppo_exchangerate,				--> oppo_exchangerate
+
+@frtopforecast = oppo_forecast,					--> oppo_forecast
+@frtopestvalmgn = oppo_estmargin,				--> oppo_estmargin
+@frtopestpctmgn = oppo_estmarginperc			--> oppo_estmarginperc
+
+
+from INSERTED
+--> ** FCL calc **
+--> ((E11+(F11*E11))/F26)+G11+H11+I11+J11+K11
+-->  ( (OCEANFREIGHT_including_BAF + [OCEANFREIGHT_including_BAF * COLLECTION_FEE] ) / fxrate )
+-->   + DESTINATION_THC + SHIPPING_LINE_DOC_FEE + CUSTOMS_CLEARANCE + DELIVERY_ORDER_CMR + CARTAGE_INCL_FAF
+
+--> (((frmx_priceoceanfrtcont + (frmx_priceoceanfrtcont * frmx_pricecollfeepcnt))  / @frtexchrate )
+-->  + [frmx_pricedestthc] + [frmx_priceshplinedoc] + [frmx_pricecstmclrnce] + [frmx_pricedelordcmr] + [frmx_pricecartagecont])
+
+-->  ** LCL calc **
+--> L11+L12+L13+H15+I15+(J15*R2)
+--> [L10/J2] + [=IF(L11*D15>20,L11*D15,20)] + [=IF(R2<1,G15,R2*G15)] + [=VLOOKUP(A15,LCL!A:N,7,0)] + [=VLOOKUP(A15,LCL!A:L,8,0)]+ ([=VLOOKUP(A15,LCL!A:L,8,0)]*[=(F2/R4)*R3])
+
+--> L11 --> [(( (qty/qtyincarton)*cartonm3)* OCEAN_FREIGHT_INCL_BAF) / fxrate] +
+-->	L12 -->	  case when  [(( (qty/qtyincarton)*cartonm3)* OCEAN_FREIGHT_INCL_BAF) / fxrate] > 20 then [(( (qty/qtyincarton)*cartonm3)* OCEAN_FREIGHT_INCL_BAF) / fxrate] else 20
+-->	L13 -->		case when  [((qty/qtyincarton)*cartonm3)] >= 1 then [((qty/qtyincarton)*cartonm3)] else [destination_per_wm]
+-->	H15 -->			[dest_inc_3_lines]
+-->	I15 -->				[custclr_bi_lading]
+-->	J15 * R2 -->			[delord_per_wm]* [((qty/qtyincarton)*cartonm3)]
+
+-->			((((@frtqty/@frtnuminctn) * @frtctncubic) * [frmx_priceoceanfrtwgtm]) / @frtexchrate ) +
+-->				case when ((((@frtqty/@frtnuminctn) * @frtctncubic) * frmx_priceoceanfrtwgtm) / @frtexchrate ) > 20 then ((((@frtqty/@frtnuminctn) * @frtctncubic) * frmx_priceoceanfrtwgtm) / @frtexchrate ) else 20 end  +
+-->					case when ((@frtqty/@frtnuminctn) * @frtctncubic) >= 1 then ((@frtqty/@frtnuminctn) * @frtctncubic) else  [frmx_pricedestchrgwgtm]  end  +
+-->						[frmx_pricecstmclrnce] +
+-->							[frmx_pricecstmclrnce] +
+-->								([frmx_pricedelordcmr] * ((@frtqty/@frtnuminctn) * @frtctncubic))
+
+
+
+
+
+
+
+-- calc choices FCL 40GP
+if	@frtstatus = 'calc'  and  @frttype = 'FCL' and @frteqpt = '40GP'
+begin
+-- case statement for destination
+set @frtdest =(select case @frtdest_code
+                      when 'DUD' then 'Port Chalmers'
+                      when 'CHC' then 'Christchurch'
+                      when 'LYT' then 'Lyttelton'
+                      when 'AKL' then 'Auckland'
+                      when 'BNE' then 'Brisbane'
+                      when 'SYD' then 'Sydney'
+                      when 'MEL' then 'Melbourne'
+                      else @frtdest_code end )
+set @frtamt = ( select (((frmx_priceoceanfrtcont + (frmx_priceoceanfrtcont * frmx_pricecollfeepcnt))  / @frtexchrate ) + [frmx_pricedestthc] + [frmx_priceshplinedoc] + [frmx_pricecstmclrnce] + [frmx_pricedelordcmr] + [frmx_pricecartagecont]) from freightmatrix where frmx_conttype = @frteqpt and frmx_portorigin = @frtorgn and frmx_portdest = @frtdest)
+update dbo.[opportunity]
+set
+oppo_freight = @frtamt,
+oppo_frtcalccubic = (@frtnuminctn * @frtctncubic),
+oppo_totalusdvalue = (@frtqty * @frtunitcst) + @frtamt + @frtothcst,
+oppo_totnzdcosts =  ((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate,
+oppo_totalproductusdcost = (@frtqty * @frtunitcst) + @frtothcst,
+oppo_totalproductnzdcost = ((@frtqty * @frtunitcst) + @frtothcst) / @frtexchrate,
+oppo_estmargin =  @frtopforecast - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate),
+oppo_estmarginperc = (((((@frtopforecast) - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate))/ @frtopforecast) * 100)),
+oppo_frtcalcstate ='set'
+
+where
+Oppo_OpportunityId = @oppocode
+end
+
+-- calc choices FCL 20GP
+if	@frtstatus = 'calc'  and  @frttype = 'FCL' and @frteqpt = '20GP'
+begin
+-- case statement for destination
+set @frtdest =(select case @frtdest_code
+                      when 'DUD' then 'Port Chalmers'
+                      when 'CHC' then 'Christchurch'
+                      when 'LYT' then 'Lyttelton'
+                      when 'AKL' then 'Auckland'
+                      when 'BNE' then 'Brisbane'
+                      when 'SYD' then 'Sydney'
+                      when 'MEL' then 'Melbourne'
+                      else @frtdest_code end )
+set @frtamt = ( select (((frmx_priceoceanfrtcont + (frmx_priceoceanfrtcont * frmx_pricecollfeepcnt))  / @frtexchrate ) + [frmx_pricedestthc] + [frmx_priceshplinedoc] + [frmx_pricecstmclrnce] + [frmx_pricedelordcmr] + [frmx_pricecartagecont]) from freightmatrix where frmx_conttype = @frteqpt and frmx_portorigin = @frtorgn and frmx_portdest = @frtdest)
+update dbo.[opportunity]
+set
+oppo_freight = @frtamt,
+oppo_frtcalccubic = (@frtnuminctn * @frtctncubic),
+oppo_totalusdvalue = (@frtqty * @frtunitcst) + @frtamt + @frtothcst,
+oppo_totnzdcosts =  ((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate,
+oppo_totalproductusdcost = (@frtqty * @frtunitcst) + @frtothcst,
+oppo_totalproductnzdcost = ((@frtqty * @frtunitcst) + @frtothcst) / @frtexchrate,
+oppo_estmargin =  @frtopforecast - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate),
+oppo_estmarginperc = (((((@frtopforecast) - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate))/ @frtopforecast) * 100)),
+oppo_frtcalcstate ='set'
+
+where
+Oppo_OpportunityId = @oppocode
+end
+
+-- calc choices LCL 20GP
+if	@frtstatus = 'calc'  and  @frttype = 'LCL' and @frteqpt = '20GP'
+begin
+-- case statement for destination
+set @frtdest =(select case @frtdest_code
+                      when 'DUD' then 'Port Chalmers'
+                      when 'CHC' then 'Christchurch'
+                      when 'LYT' then 'Lyttelton'
+                      when 'AKL' then 'Auckland'
+                      when 'BNE' then 'Brisbane'
+                      when 'SYD' then 'Sydney'
+                      when 'MEL' then 'Melbourne'
+                      else @frtdest_code end )
+              --> set @frtamt = ( select frmx_priceoceanfrtcont from freightmatrix where frmx_conttype = @frteqpt and frmx_portorigin = @frtorgn and frmx_portdest = @frtdest)
+set @frtamt = ( select
+                  ((((@frtqty/@frtnuminctn) * @frtctncubic) * [frmx_priceoceanfrtwgtm]) / @frtexchrate ) +
+                  case when ((((@frtqty/@frtnuminctn) * @frtctncubic) * frmx_priceoceanfrtwgtm) / @frtexchrate ) > 20 then ((((@frtqty/@frtnuminctn) * @frtctncubic) * frmx_priceoceanfrtwgtm) / @frtexchrate ) else 20 end  +
+                  case when ((@frtqty/@frtnuminctn) * @frtctncubic) >= 1 then ((@frtqty/@frtnuminctn) * @frtctncubic) else  [frmx_pricedestchrgwgtm]  end  +
+                [frmx_pricecstmclrnce] +
+                 [frmx_pricecstmclrnce] +
+([frmx_pricedelordcmr] * ((@frtqty/@frtnuminctn) * @frtctncubic))
+from freightmatrix where frmx_conttype = @frteqpt and frmx_portorigin = @frtorgn and frmx_portdest = @frtdest)
+
+
+
+
+update dbo.[opportunity]
+set
+oppo_freight = @frtamt,
+oppo_frtcalccubic = (@frtnuminctn * @frtctncubic),
+oppo_totalusdvalue = (@frtqty * @frtunitcst) + @frtamt + @frtothcst,
+oppo_totnzdcosts =  ((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate,
+oppo_totalproductusdcost = (@frtqty * @frtunitcst) + @frtothcst,
+oppo_totalproductnzdcost = ((@frtqty * @frtunitcst) + @frtothcst) / @frtexchrate,
+oppo_estmargin =  @frtopforecast - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate),
+oppo_estmarginperc = (((((@frtopforecast) - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate))/ @frtopforecast) * 100)),
+oppo_frtcalcstate ='set'
+
+where
+Oppo_OpportunityId = @oppocode
+end
+
+-- calc choices LCL 40GP
+if	@frtstatus = 'calc'  and  @frttype = 'LCL' and @frteqpt = '40GP'
+begin
+set @frtamt = ( select
+                  ((((@frtqty/@frtnuminctn) * @frtctncubic) * [frmx_priceoceanfrtwgtm]) / @frtexchrate ) +
+                  case when ((((@frtqty/@frtnuminctn) * @frtctncubic) * frmx_priceoceanfrtwgtm) / @frtexchrate ) > 20 then ((((@frtqty/@frtnuminctn) * @frtctncubic) * frmx_priceoceanfrtwgtm) / @frtexchrate ) else 20 end  +
+                  case when ((@frtqty/@frtnuminctn) * @frtctncubic) >= 1 then ((@frtqty/@frtnuminctn) * @frtctncubic) else  [frmx_pricedestchrgwgtm]  end  +
+                [frmx_pricecstmclrnce] +
+                 [frmx_pricecstmclrnce] +
+([frmx_pricedelordcmr] * ((@frtqty/@frtnuminctn) * @frtctncubic))
+from freightmatrix where frmx_conttype = @frteqpt and frmx_portorigin = @frtorgn and frmx_portdest = @frtdest)
+
+update dbo.[opportunity]
+set
+oppo_freight = @frtamt,
+oppo_frtcalccubic = (@frtnuminctn * @frtctncubic),
+oppo_totalusdvalue = (@frtqty * @frtunitcst) + @frtamt + @frtothcst,
+oppo_totnzdcosts =  ((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate,
+oppo_totalproductusdcost = (@frtqty * @frtunitcst) + @frtothcst,
+oppo_totalproductnzdcost = ((@frtqty * @frtunitcst) + @frtothcst) / @frtexchrate,
+oppo_estmargin =  @frtopforecast - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate),
+oppo_estmarginperc = (((((@frtopforecast) - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate))/ @frtopforecast) * 100)),
+oppo_frtcalcstate ='set'
+
+where
+Oppo_OpportunityId = @oppocode
+end
+
+if	@frtstatus = 'reset'
+begin
+set @frtamt = 0
+update dbo.[opportunity]
+set
+
+oppo_freight = @frtamt,
+oppo_frtcalccubic = (@frtnuminctn * @frtctncubic),
+oppo_totalusdvalue = (@frtqty * @frtunitcst) + @frtamt + @frtothcst,
+oppo_totnzdcosts =  ((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate,
+oppo_totalproductusdcost = (@frtqty * @frtunitcst) + @frtothcst,
+oppo_totalproductnzdcost = ((@frtqty * @frtunitcst) + @frtothcst) / @frtexchrate,
+oppo_estmargin =  @frtopforecast - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate),
+oppo_estmarginperc = (((((@frtopforecast) - (((@frtqty * @frtunitcst) + @frtamt + @frtothcst) / @frtexchrate))/ @frtopforecast) * 100)),
+oppo_frtcalcstate ='notset'
+
+where
+Oppo_OpportunityId = @oppocode
+end
+end
+END
+
+GO
+
+

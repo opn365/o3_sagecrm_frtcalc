@@ -4,6 +4,8 @@ Directory that contains SQL code related to FreightMatrix
 
 Added Formatting Line feed
 
-Added new comment
+    Added new comment
 
 Update Code | Commit | Push
+
+Added Trigger code for oppoUpd
